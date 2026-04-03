@@ -375,6 +375,13 @@ class GatewayRunner:
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
 
+        # Ensure plugins are discovered in gateway mode (for /tasklist, etc.)
+        try:
+            from hermes_cli.plugins import discover_plugins
+            discover_plugins()
+        except Exception:
+            pass
+
         # Load ephemeral config from config.yaml / env vars.
         # Both are injected at API-call time only and never persisted.
         self._prefill_messages = self._load_prefill_messages()

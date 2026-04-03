@@ -106,6 +106,7 @@ class LoadedPlugin:
     module: Optional[types.ModuleType] = None
     tools_registered: List[str] = field(default_factory=list)
     hooks_registered: List[str] = field(default_factory=list)
+    commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
 
@@ -115,7 +116,7 @@ class LoadedPlugin:
 # ---------------------------------------------------------------------------
 
 class PluginContext:
-    """Facade given to plugins so they can register tools and hooks."""
+    """Facade given to plugins so they can register tools, hooks and commands."""
 
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
@@ -180,6 +181,25 @@ class PluginContext:
             cli._pending_input.put(msg)
         return True
 
+    # -- command registration -----------------------------------------------
+
+    def register_command(self, name: str, handler: Callable, description: str = "") -> None:
+        """Register a slash command handler available to CLI and gateway."""
+        command_name = str(name).strip().lstrip("/")
+        if not command_name:
+            raise ValueError("command name must not be empty")
+        self._manager._plugin_commands[command_name] = handler
+        self._manager._plugin_command_names.add(command_name)
+        plugin = self._manager._plugins.get(self.manifest.name)
+        if plugin is not None:
+            plugin.commands_registered.append(command_name)
+        logger.debug(
+            "Plugin %s registered command: %s%s",
+            self.manifest.name,
+            command_name,
+            f" ({description})" if description else "",
+        )
+
     # -- hook registration --------------------------------------------------
 
     def register_hook(self, hook_name: str, callback: Callable) -> None:
@@ -210,7 +230,9 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._plugin_commands: Dict[str, Callable] = {}
         self._plugin_tool_names: Set[str] = set()
+        self._plugin_command_names: Set[str] = set()
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
 
@@ -335,6 +357,7 @@ class PluginManager:
     def _load_plugin(self, manifest: PluginManifest) -> None:
         """Import a plugin module and call its ``register(ctx)`` function."""
         loaded = LoadedPlugin(manifest=manifest)
+        self._plugins[manifest.name] = loaded
 
         try:
             if manifest.source in ("user", "project"):
@@ -475,6 +498,7 @@ class PluginManager:
                     "enabled": loaded.enabled,
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
+                    "commands": len(loaded.commands_registered),
                     "error": loaded.error,
                 }
             )
@@ -512,6 +536,16 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 def get_plugin_tool_names() -> Set[str]:
     """Return the set of tool names registered by plugins."""
     return get_plugin_manager()._plugin_tool_names
+
+
+def get_plugin_cmd_handler_names() -> Set[str]:
+    """Return the set of plugin slash command names."""
+    return get_plugin_manager()._plugin_command_names
+
+
+def get_plugin_command_handler(name: str):
+    """Return a registered plugin command handler, if any."""
+    return get_plugin_manager()._plugin_commands.get(name)
 
 
 def get_plugin_toolsets() -> List[tuple]:
