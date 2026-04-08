@@ -135,11 +135,22 @@ git push origin --tags
 
 | Operación | Frecuencia | Ejecutor |
 |-----------|-----------|----------|
-| Commit/push cambios relevantes | Por evento | FATI (automático) |
-| Sync upstream → main | Por release | FATI (manual/cron) |
-| Limpieza de branches | Nocturno | Cron + dream cycle |
+| Commit/push cambios relevantes | Por evento | FATI |
+| Sync upstream → main | Por release | FATI (manual) |
+| Mirror + branch cleanup + reporte | Nocturno | Cron oficial único |
 | Revisión de tags y basura | Semanal | Cris + FATI |
 | Checkpoint pre-riesgo | Por evento | FATI (antes de cambios grandes) |
+
+### Automatización real (TASK ID 0021 — FASE 2)
+
+- **Job oficial único:** `TASK 0021 — GitHub mirror nightly (official)`
+- **Job ID:** `aff0d6b0b5a0`
+- **Schedule:** `30 3 * * *` (03:30 UTC / 00:30 ARG)
+- **Modelo:** `openai-codex / gpt-5.4-mini`
+- **Skill:** `github-mirror-workflow`
+- **Delivery:** `origin`
+- **Scope del job:** fetch/prune, comparación `origin_total` vs `upstream_total` vs `origin_only`, limpieza segura solo de `origin-only` no protegidas, chequeo básico de estabilidad/tracking, reporte corto con evidencia.
+- **No duplicidad con Dream Cycle:** Dream queda como reflexión/sugerencias y no ejecuta housekeeping principal del mirror.
 
 ---
 
