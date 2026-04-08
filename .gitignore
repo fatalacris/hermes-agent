@@ -58,3 +58,50 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+
+# ═══════════════════════════════════════════════════════
+# FATI Mirror — exclusions for local-first + GitHub mirror workflow
+# See docs/GITHUB-WORKFLOW.md for full policy
+# ═══════════════════════════════════════════════════════
+
+# Sessions (raw transcripts — never mirror; only summaries/incidents go to docs/)
+sessions/
+*.jsonl
+
+# Auth and secrets
+auth.json
+auth.lock
+*.token
+credentials/
+secrets/
+
+# Hermes state and caches
+state.db
+state.db-*
+*.sqlite
+*.sqlite-*
+cache/
+tool_responses/
+audio_cache/
+
+# Processes and runtime
+processes.json
+channel_directory.json
+
+# Plugins runtime state (plugins themselves may be versioned separately)
+plugins/*/state/
+plugins/*/__pycache__/
+
+# Build and package artifacts
+dist/
+build/
+*.egg-info/
+*.whl
+*.tar.gz
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
