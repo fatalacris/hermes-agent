@@ -21,6 +21,8 @@ import re
 import shlex
 import sys
 import signal
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -1770,6 +1772,16 @@ class GatewayRunner:
         if config and hasattr(config, "get_unauthorized_dm_behavior"):
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
+
+    def _is_gateway_owner(self, source: SessionSource) -> bool:
+        """Return True when the message came from the configured Telegram owner."""
+        owner_chat_id = os.getenv("HERMES_GATEWAY_OWNER_CHAT_ID", "8224759576").strip()
+        return bool(
+            source
+            and source.platform == Platform.TELEGRAM
+            and source.chat_id is not None
+            and str(source.chat_id).strip() == owner_chat_id
+        )
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -1785,6 +1797,9 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+
+        if event.get_command() == "restart":
+            return await self._handle_restart_command(event)
 
         # Check if user is authorized
         if not self._is_user_authorized(source):
@@ -2135,6 +2150,9 @@ class GatewayRunner:
 
         if canonical == "update":
             return await self._handle_update_command(event)
+
+        if canonical == "restart":
+            return await self._handle_restart_command(event)
 
         if canonical == "title":
             return await self._handle_title_command(event)
@@ -5528,6 +5546,64 @@ class GatewayRunner:
         Platform.FEISHU, Platform.WECOM, Platform.LOCAL,
     })
 
+    async def _handle_restart_command(self, event: MessageEvent) -> str:
+        """Handle /restart command from the Telegram owner.
+
+        The restart is launched in a detached background process so the current
+        gateway process can finish sending the confirmation message before the
+        service manager replaces it.
+        """
+        from hermes_cli.config import is_managed, format_managed_message
+
+        source = event.source
+        platform = source.platform
+        if platform != Platform.TELEGRAM:
+            return "✗ /restart is only available from Telegram."
+
+        if not self._is_gateway_owner(source):
+            logger.warning(
+                "Unauthorized /restart attempt: user=%s chat=%s platform=%s",
+                source.user_id,
+                source.chat_id,
+                platform.value,
+            )
+            return "✗ /restart is restricted to the Telegram owner."
+
+        if is_managed():
+            return f"✗ {format_managed_message('restart Hermes Gateway')}"
+
+        hermes_cmd = _resolve_hermes_bin()
+        if not hermes_cmd:
+            return (
+                "✗ Could not locate the `hermes` command. "
+                "Run `hermes gateway restart` manually from the terminal."
+            )
+
+        restart_cmd = hermes_cmd + ["gateway", "restart"]
+        cmd_str = " ".join(shlex.quote(part) for part in restart_cmd)
+        restart_shell_cmd = f"PYTHONUNBUFFERED=1 {cmd_str}"
+
+        try:
+            setsid_bin = shutil.which("setsid")
+            if setsid_bin:
+                subprocess.Popen(
+                    [setsid_bin, "bash", "-c", restart_shell_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            else:
+                subprocess.Popen(
+                    ["bash", "-c", restart_shell_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        except Exception as e:
+            return f"✗ Failed to start gateway restart: {e}"
+
+        return "🔄 Restarting Hermes gateway in the background…"
+
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update command — update Hermes Agent to the latest version.
 
@@ -5537,8 +5613,6 @@ class GatewayRunner:
         can notify the user when the update finishes.
         """
         import json
-        import shutil
-        import subprocess
         from datetime import datetime
         from hermes_cli.config import is_managed, format_managed_message
 
