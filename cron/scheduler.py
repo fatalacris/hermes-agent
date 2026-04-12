@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import datetime
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -47,7 +48,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "wecom", "sms", "email", "webhook",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, load_jobs
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -516,6 +517,141 @@ def _build_job_prompt(job: dict) -> str:
     return "\n".join(parts)
 
 
+def _is_dream_cycle_job(job: dict) -> bool:
+    """Return True when the job is the Dream cycle / Dream watchdog flow."""
+    name = str(job.get("name") or "").strip().lower()
+    if "dream" in name:
+        return True
+
+    skills = job.get("skills")
+    if skills is None:
+        legacy_skill = job.get("skill")
+        skills = [legacy_skill] if legacy_skill else []
+
+    for skill_name in skills:
+        normalized = str(skill_name or "").strip().lower()
+        if normalized == "fati-dream-cycle" or "dream-cycle" in normalized:
+            return True
+
+    prompt = str(job.get("prompt") or "").strip().lower()
+    return "fati-dream-cycle" in prompt or "dream cycle" in prompt
+
+
+def _capture_post_run_integrity(job: dict, session_id: str) -> dict:
+    """Snapshot the evidence sources used by the cron integrity watchdog."""
+    integrity = {
+        "session_id": session_id,
+        "run_started_at": _hermes_now(),
+        "is_dream_job": _is_dream_cycle_job(job),
+    }
+
+    if integrity["is_dream_job"]:
+        dream_log_path = _hermes_home / "dream-log.md"
+        integrity["dream_log_path"] = str(dream_log_path)
+        integrity["dream_log_size_before"] = dream_log_path.stat().st_size if dream_log_path.exists() else None
+
+    return integrity
+
+
+def _validate_post_run_integrity(job: dict, integrity: dict, success: bool) -> None:
+    """Fail loudly if the post-run evidence drifted or stayed stale."""
+    if not integrity:
+        return
+
+    run_started_at = integrity.get("run_started_at")
+    if run_started_at is None:
+        raise RuntimeError(
+            f"Cron integrity snapshot missing run start time for job '{job.get('name', job.get('id', '?'))}'"
+        )
+
+    expected_status = "ok" if success else "error"
+    jobs = load_jobs()
+    current_job = next((item for item in jobs if item.get("id") == job.get("id")), None)
+    if current_job is None:
+        repeat = job.get("repeat") or {}
+        repeat_times = repeat.get("times")
+        repeat_completed = int(repeat.get("completed") or 0)
+        try:
+            repeat_limit = int(repeat_times) if repeat_times is not None else None
+        except (TypeError, ValueError):
+            repeat_limit = None
+
+        if repeat_limit is not None and repeat_limit > 0 and repeat_completed + 1 >= repeat_limit:
+            return
+
+        raise RuntimeError(f"Cron jobs metadata missing job '{job.get('id', '?')}' after run")
+
+    observed_status = current_job.get("last_status")
+    if observed_status != expected_status:
+        raise RuntimeError(
+            f"Cron jobs metadata stale for job '{job.get('id', '?')}': "
+            f"expected last_status={expected_status!r}, observed {observed_status!r}"
+        )
+
+    last_run_at = current_job.get("last_run_at")
+    if not last_run_at:
+        raise RuntimeError(
+            f"Cron jobs metadata missing last_run_at for job '{job.get('id', '?')}' after run"
+        )
+
+    try:
+        observed_run_at = datetime.fromisoformat(last_run_at)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cron jobs metadata has invalid last_run_at for job '{job.get('id', '?')}': {last_run_at!r}"
+        ) from exc
+
+    if observed_run_at <= run_started_at:
+        raise RuntimeError(
+            f"Cron jobs metadata stale for job '{job.get('id', '?')}': "
+            f"last_run_at={last_run_at!r} did not advance past run start {run_started_at.isoformat()}"
+        )
+
+    if not integrity.get("is_dream_job") or not success:
+        return
+
+    session_db = integrity.get("session_db")
+    if session_db is None:
+        raise RuntimeError(
+            f"Dream integrity check failed for job '{job.get('id', '?')}': SQLite session store unavailable"
+        )
+
+    session_snapshot = integrity.get("session_snapshot")
+    if not session_snapshot:
+        raise RuntimeError(
+            f"Dream integrity check failed for job '{job.get('id', '?')}': "
+            f"cron session '{integrity.get('session_id', '?')}' was not persisted to SQLite"
+        )
+
+    message_count = int(session_snapshot.get("message_count") or 0)
+    if message_count <= 0:
+        raise RuntimeError(
+            f"Dream integrity check failed for job '{job.get('id', '?')}': "
+            f"cron session '{integrity.get('session_id', '?')}' persisted with no messages"
+        )
+
+    dream_log_path = Path(integrity["dream_log_path"])
+    dream_log_size_before = integrity.get("dream_log_size_before")
+    dream_log_size_after = dream_log_path.stat().st_size if dream_log_path.exists() else None
+    if dream_log_size_after is None:
+        raise RuntimeError(
+            f"Dream integrity check failed for job '{job.get('id', '?')}': missing {dream_log_path} append"
+        )
+    if dream_log_size_before is None:
+        if dream_log_size_after <= 0:
+            raise RuntimeError(
+                f"Dream integrity check failed for job '{job.get('id', '?')}': {dream_log_path} stayed empty"
+            )
+    elif dream_log_size_after <= dream_log_size_before:
+        raise RuntimeError(
+            f"Dream integrity check failed for job '{job.get('id', '?')}': "
+            f"{dream_log_path} did not grow during the run"
+        )
+
+    integrity["session_message_count"] = message_count
+    integrity["dream_log_size_after"] = dream_log_size_after
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -542,6 +678,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
+    job["_post_run_integrity"] = _capture_post_run_integrity(job, _cron_session_id)
+    job["_post_run_integrity"]["session_db"] = _session_db
 
     try:
         # Inject origin context so the agent's send_message tool knows the chat.
@@ -742,6 +880,55 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
 
         final_response = result.get("final_response", "") or ""
+        agent_messages = result.get("messages") or []
+        assistant_seen = any(isinstance(m, dict) and m.get("role") == "assistant" for m in agent_messages)
+        tool_seen = any(isinstance(m, dict) and m.get("role") == "tool" for m in agent_messages)
+        agent_failed_early = (
+            (result.get("failed") or result.get("interrupted") or result.get("completed") is False)
+            and not final_response
+            and not assistant_seen
+            and not tool_seen
+        )
+        if agent_failed_early:
+            failure_detail = result.get("error") or result.get("interrupt_message") or "agent exited before producing any assistant output"
+            raise RuntimeError(f"Cron agent failed before producing output: {failure_detail}")
+
+        integrity = job.get("_post_run_integrity") or {}
+        if integrity.get("is_dream_job"):
+            session_snapshot = None
+            if _session_db is not None:
+                session_snapshot = _session_db.get_session(_cron_session_id)
+            integrity["session_snapshot"] = session_snapshot
+            if session_snapshot is None:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': "
+                    f"cron session '{_cron_session_id}' was not persisted to SQLite"
+                )
+            message_count = int(session_snapshot.get("message_count") or 0)
+            if message_count <= 0:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': "
+                    f"cron session '{_cron_session_id}' persisted with no messages"
+                )
+            dream_log_path = Path(integrity["dream_log_path"])
+            dream_log_size_before = integrity.get("dream_log_size_before")
+            dream_log_size_after = dream_log_path.stat().st_size if dream_log_path.exists() else None
+            if dream_log_size_after is None:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': missing {dream_log_path} append"
+                )
+            if dream_log_size_before is None:
+                if dream_log_size_after <= 0:
+                    raise RuntimeError(
+                        f"Dream integrity check failed for job '{job_name}': {dream_log_path} stayed empty"
+                    )
+            elif dream_log_size_after <= dream_log_size_before:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': {dream_log_path} did not grow during the run"
+                )
+            integrity["session_message_count"] = message_count
+            integrity["dream_log_size_after"] = dream_log_size_after
+
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -882,6 +1069,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                _validate_post_run_integrity(job, job.get("_post_run_integrity") or {}, success)
                 executed += 1
 
             except Exception as e:

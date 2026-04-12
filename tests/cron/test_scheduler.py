@@ -3,11 +3,12 @@
 import json
 import logging
 import os
+from datetime import datetime
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, tick
 
 
 class TestResolveOrigin:
@@ -677,6 +678,46 @@ class TestRunJobSessionPersistence:
         # But the output log should show the placeholder
         assert "(No response generated)" in output
 
+    def test_run_job_failed_early_result_is_error(self, tmp_path):
+        """A failed early agent result with no assistant/tool output must not be marked ok."""
+        job = {
+            "id": "failed-early-job",
+            "name": "failed early test",
+            "prompt": "test early failure",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "failed": True,
+                "completed": False,
+                "final_response": None,
+                "messages": [{"role": "user", "content": "test early failure"}],
+                "error": "Non-retryable client error",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "Cron agent failed before producing output" in error
+        assert "FAILED" in output
+
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
             "id": "test-job",
@@ -729,6 +770,101 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+        fake_db.close.assert_called_once()
+
+    def test_run_job_dream_cycle_requires_session_evidence_and_log_append(self, tmp_path):
+        job = {
+            "id": "dream-job",
+            "name": "Dream cycle",
+            "skill": "fati-dream-cycle",
+            "prompt": "run the nightly dream audit",
+        }
+        fake_db = MagicMock()
+        dream_log = tmp_path / "dream-log.md"
+        dream_log.write_text("# Before\n", encoding="utf-8")
+        before_size = dream_log.stat().st_size
+
+        def fake_run_conversation(*args, **kwargs):
+            dream_log.write_text(dream_log.read_text(encoding="utf-8") + "## appended\n", encoding="utf-8")
+            return {"final_response": "done"}
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return fake_run_conversation(*args, **kwargs)
+
+        fake_db.get_session.side_effect = lambda session_id: {"id": session_id, "message_count": 3}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "done"
+        assert "done" in output
+        assert job["_post_run_integrity"]["is_dream_job"] is True
+        assert job["_post_run_integrity"]["session_message_count"] == 3
+        assert job["_post_run_integrity"]["dream_log_size_after"] > before_size
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+
+    def test_run_job_dream_cycle_fails_when_dream_log_is_not_appended(self, tmp_path):
+        job = {
+            "id": "dream-job-missing-log",
+            "name": "Dream cycle",
+            "skill": "fati-dream-cycle",
+            "prompt": "run the nightly dream audit",
+        }
+        fake_db = MagicMock()
+        dream_log = tmp_path / "dream-log.md"
+        dream_log.write_text("# Before\n", encoding="utf-8")
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "done"}
+
+        fake_db.get_session.side_effect = lambda session_id: {"id": session_id, "message_count": 3}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error is not None
+        assert "did not grow" in error or "append" in error
+        assert "FAILED" in output
+        fake_db.end_session.assert_called_once()
         fake_db.close.assert_called_once()
 
 
@@ -1128,6 +1264,86 @@ class TestTickAdvanceBeforeRun:
         adv_mock.assert_called_once_with("test-advance")
         # advance must happen before run
         assert call_order == [("advance", "test-advance"), ("run", "test-advance")]
+
+
+class TestTickIntegrityWatchdog:
+    """Verify tick() surfaces stale cron metadata instead of silently succeeding."""
+
+    def test_stale_jobs_metadata_triggers_failure_mark(self, tmp_path):
+        job = {
+            "id": "integrity-job",
+            "name": "Regular cron job",
+            "prompt": "hello",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "15 6 * * *"},
+        }
+        stale_jobs = [
+            {
+                "id": "integrity-job",
+                "last_status": "scheduled",
+                "last_run_at": "2000-01-01T00:00:00+00:00",
+            }
+        ]
+        call_order = []
+
+        def fake_run_job(job_arg):
+            call_order.append(("run", job_arg["id"]))
+            job_arg["_post_run_integrity"] = {
+                "run_started_at": datetime.now().astimezone(),
+                "is_dream_job": False,
+                "session_id": "cron_integrity-job_20260411_000000",
+            }
+            return True, "# output", "response", None
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run", return_value=True), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run") as mark_mock, \
+             patch("cron.scheduler.load_jobs", return_value=stale_jobs):
+            executed = tick(verbose=False)
+
+        assert executed == 0
+        assert call_order == [("run", "integrity-job")]
+        assert mark_mock.call_count == 2
+        assert mark_mock.call_args_list[0].args[:2] == ("integrity-job", True)
+        assert mark_mock.call_args_list[1].args[:2] == ("integrity-job", False)
+        assert "stale" in (mark_mock.call_args_list[1].args[2] or "").lower()
+
+    def test_repeat_limit_job_missing_from_jobs_after_success_is_allowed(self, tmp_path):
+        job = {
+            "id": "repeat-job",
+            "name": "Repeat-limited cron job",
+            "prompt": "hello",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "15 6 * * *"},
+            "repeat": {"times": 1, "completed": 0},
+        }
+        call_order = []
+
+        def fake_run_job(job_arg):
+            call_order.append(("run", job_arg["id"]))
+            job_arg["_post_run_integrity"] = {
+                "run_started_at": datetime.now().astimezone(),
+                "is_dream_job": False,
+                "session_id": "cron_repeat-job_20260411_000000",
+            }
+            return True, "# output", "response", None
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run", return_value=True), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run") as mark_mock, \
+             patch("cron.scheduler.load_jobs", return_value=[]):
+            executed = tick(verbose=False)
+
+        assert executed == 1
+        assert call_order == [("run", "repeat-job")]
+        assert mark_mock.call_count == 1
+        assert mark_mock.call_args.args[:2] == ("repeat-job", True)
 
 
 class TestSendMediaViaAdapter:
