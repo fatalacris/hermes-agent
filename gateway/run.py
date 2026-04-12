@@ -21,6 +21,8 @@ import re
 import shlex
 import sys
 import signal
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -3097,6 +3099,16 @@ class GatewayRunner:
             return "ignore"
 
         return "pair"
+
+    def _is_gateway_owner(self, source: SessionSource) -> bool:
+        """Return True when the message came from the configured Telegram owner."""
+        owner_chat_id = os.getenv("HERMES_GATEWAY_OWNER_CHAT_ID", "8224759576").strip()
+        return bool(
+            source
+            and source.platform == Platform.TELEGRAM
+            and source.chat_id is not None
+            and str(source.chat_id).strip() == owner_chat_id
+        )
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -7754,8 +7766,6 @@ class GatewayRunner:
         can notify the user when the update finishes.
         """
         import json
-        import shutil
-        import subprocess
         from datetime import datetime
         from hermes_cli.config import is_managed, format_managed_message
 
