@@ -542,6 +542,10 @@ class GatewayRunner:
         # Key: session_key, Value: True when a prompt is waiting for user input.
         self._update_prompt_pending: Dict[str, bool] = {}
 
+        # Restart confirmation notifications use a simple marker file so the
+        # next gateway process can acknowledge the reboot exactly once.
+        self._restart_confirmation_lock = None
+
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
         # per-message AIAgent instances.
@@ -1245,6 +1249,10 @@ class GatewayRunner:
             )
         ):
             self._schedule_update_notification_watch()
+
+        # If the gateway was restarted from Telegram, confirm the reboot once
+        # the Telegram adapter is available again.
+        await self._send_restart_confirmation()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -5583,6 +5591,18 @@ class GatewayRunner:
         cmd_str = " ".join(shlex.quote(part) for part in restart_cmd)
         restart_shell_cmd = f"PYTHONUNBUFFERED=1 {cmd_str}"
 
+        restart_marker_path = _hermes_home / ".gateway_restart_pending.json"
+        restart_pending = {
+            "platform": platform.value,
+            "chat_id": str(source.chat_id),
+            "user_id": str(source.user_id),
+            "session_key": self._session_key_for_source(source),
+            "timestamp": datetime.now().isoformat(),
+        }
+        _tmp_restart_marker = restart_marker_path.with_suffix(".tmp")
+        _tmp_restart_marker.write_text(json.dumps(restart_pending), encoding="utf-8")
+        _tmp_restart_marker.replace(restart_marker_path)
+
         try:
             setsid_bin = shutil.which("setsid")
             if setsid_bin:
@@ -5600,9 +5620,69 @@ class GatewayRunner:
                     start_new_session=True,
                 )
         except Exception as e:
+            restart_marker_path.unlink(missing_ok=True)
             return f"✗ Failed to start gateway restart: {e}"
 
         return "🔄 Restarting Hermes gateway in the background…"
+
+    async def _send_restart_confirmation(self) -> bool:
+        """Send the Telegram confirmation after a gateway restart.
+
+        The /restart handler writes a marker file before replacing the gateway.
+        On the next startup, or on the cron ticker's periodic retry, this helper
+        consumes that marker and sends a single confirmation message back to the
+        original Telegram chat.
+
+        Returns True once the marker has been definitively handled, whether by
+        sending the confirmation or discarding a stale/corrupt marker. Returns
+        False when the marker should be retried later.
+        """
+        marker_path = _hermes_home / ".gateway_restart_pending.json"
+
+        if not marker_path.exists():
+            return False
+
+        lock = getattr(self, "_restart_confirmation_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._restart_confirmation_lock = lock
+
+        async with lock:
+            if not marker_path.exists():
+                return False
+
+            try:
+                pending = json.loads(marker_path.read_text())
+            except Exception as exc:
+                logger.warning("Restart confirmation marker is corrupt, discarding it: %s", exc)
+                marker_path.unlink(missing_ok=True)
+                return True
+
+            platform_str = str(pending.get("platform") or "").strip().lower()
+            chat_id = str(pending.get("chat_id") or "").strip()
+
+            if platform_str != Platform.TELEGRAM.value or not chat_id:
+                logger.warning(
+                    "Restart confirmation marker missing Telegram target, discarding it: %s",
+                    pending,
+                )
+                marker_path.unlink(missing_ok=True)
+                return True
+
+            adapter = self.adapters.get(Platform.TELEGRAM)
+            if adapter is None:
+                logger.info("Restart confirmation deferred: Telegram adapter not yet connected")
+                return False
+
+            try:
+                await adapter.send(chat_id, "✅ Hermes gateway restarted.")
+            except Exception as exc:
+                logger.warning("Restart confirmation send failed, will retry later: %s", exc)
+                return False
+
+            marker_path.unlink(missing_ok=True)
+            logger.info("Sent restart confirmation to Telegram chat %s", chat_id)
+            return True
 
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update command — update Hermes Agent to the latest version.
@@ -7435,7 +7515,7 @@ class GatewayRunner:
         return response
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, runner=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
     
@@ -7470,6 +7550,17 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                 build_channel_directory(adapters)
             except Exception as e:
                 logger.debug("Channel directory refresh error: %s", e)
+
+        if runner is not None and loop is not None:
+            try:
+                marker_path = _hermes_home / ".gateway_restart_pending.json"
+                if marker_path.exists():
+                    asyncio.run_coroutine_threadsafe(
+                        runner._send_restart_confirmation(),
+                        loop,
+                    )
+            except Exception as e:
+                logger.debug("Restart confirmation scheduling error: %s", e)
 
         if tick_count % IMAGE_CACHE_EVERY == 0:
             try:
@@ -7645,7 +7736,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_thread = threading.Thread(
         target=_start_cron_ticker,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "runner": runner},
         daemon=True,
         name="cron-ticker",
     )
