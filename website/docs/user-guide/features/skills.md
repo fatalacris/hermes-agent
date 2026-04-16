@@ -155,10 +155,10 @@ Skills can also declare non-secret config settings (paths, preferences) stored i
 metadata:
   hermes:
     config:
-      - key: wiki.path
-        description: Path to the wiki directory
-        default: "~/wiki"
-        prompt: Wiki directory path
+      - key: myplugin.path
+        description: Path to the plugin data directory
+        default: "~/myplugin-data"
+        prompt: Plugin data directory path
 ```
 
 Settings are stored under `skills.config` in your config.yaml. `hermes config migrate` prompts for unconfigured settings, and `hermes config show` displays them. When a skill loads, its resolved config values are injected into the context so the agent knows the configured values automatically.
@@ -425,6 +425,10 @@ hermes skills update react   # Update one specific installed hub skill
 ```
 
 This uses the stored source identifier plus the current upstream bundle content hash to detect drift.
+
+:::tip GitHub rate limits
+Skills hub operations use the GitHub API, which has a rate limit of 60 requests/hour for unauthenticated users. If you see rate-limit errors during install or search, set `GITHUB_TOKEN` in your `.env` file to increase the limit to 5,000 requests/hour. The error message includes an actionable hint when this happens.
+:::
 
 ### Slash commands (inside chat)
 
