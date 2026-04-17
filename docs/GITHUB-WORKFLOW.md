@@ -149,7 +149,7 @@ git push origin --tags
 - **Modelo:** sigue el routing global por defecto; no pinnea model/provider en el job.
 - **Skill:** `github-mirror-workflow`
 - **Delivery:** `origin`
-- **Scope del job:** detector/dispatcher diario. Solo crea una tarea de GitHub-maintenance cuando hay trabajo real; si no hay delta accionable, responde silencioso. La tarea debe mantenerse única, dividirse en fases si hace falta, y cerrarse al terminar.
+- **Scope del job:** detector/dispatcher diario. Solo crea una tarea de GitHub-maintenance cuando hay trabajo real; si no hay delta accionable, responde silencioso. El cron no define fases: Coder ordena, divide en fases si hace falta, ejecuta y cierra la tarea.
 - **No duplicidad con Dream Cycle:** Dream queda como reflexión/sugerencias y no ejecuta housekeeping principal del mirror.
 
 ---
