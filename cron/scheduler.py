@@ -579,7 +579,12 @@ def _build_job_prompt(job: dict) -> str:
 
 
 def _is_dream_cycle_job(job: dict) -> bool:
-    """Return True when the job is the Dream cycle / Dream watchdog flow."""
+    """Return True only for explicit Dream cycle jobs.
+
+    Do not classify by prompt text, because loaded skills/docs can mention
+    Dream cycle in explanatory or negative instructions and would otherwise
+    create false positives for unrelated cron jobs.
+    """
     name = str(job.get("name") or "").strip().lower()
     if "dream" in name:
         return True
@@ -594,8 +599,7 @@ def _is_dream_cycle_job(job: dict) -> bool:
         if normalized == "fati-dream-cycle" or "dream-cycle" in normalized:
             return True
 
-    prompt = str(job.get("prompt") or "").strip().lower()
-    return "fati-dream-cycle" in prompt or "dream cycle" in prompt
+    return False
 
 
 def _capture_post_run_integrity(job: dict, session_id: str) -> dict:
