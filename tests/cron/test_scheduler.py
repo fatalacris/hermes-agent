@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, tick
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, tick, _is_dream_cycle_job
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -46,6 +46,24 @@ class TestResolveOrigin:
     def test_empty_origin(self):
         job = {"origin": {}}
         assert _resolve_origin(job) is None
+
+
+class TestDreamJobClassification:
+    def test_prompt_mentions_dream_cycle_but_job_is_not_dream(self):
+        job = {
+            "name": "TASK 0021 — GitHub maintenance daily",
+            "skills": ["github-mirror-workflow", "fati-mini-control"],
+            "prompt": "This job runs in the same morning window as Dream state. Dream Cycle boundary only.",
+        }
+        assert _is_dream_cycle_job(job) is False
+
+    def test_explicit_dream_skill_is_detected(self):
+        job = {
+            "name": "FATI Dream Cycle — nightly",
+            "skills": ["fati-dream-cycle"],
+            "prompt": "This prompt does not matter.",
+        }
+        assert _is_dream_cycle_job(job) is True
 
 
 class TestResolveDeliveryTarget:
