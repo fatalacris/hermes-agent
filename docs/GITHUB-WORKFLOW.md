@@ -143,13 +143,13 @@ git push origin --tags
 
 ### Automatización real (TASK ID 0021 — FASE 2)
 
-- **Job oficial único:** `TASK 0021 — GitHub mirror nightly (official)`
-- **Job ID:** `aff0d6b0b5a0`
-- **Schedule:** `30 3 * * *` (03:30 UTC / 00:30 ARG)
-- **Modelo:** `openai-codex / gpt-5.4-mini`
+- **Job oficial único:** `TASK 0021 — GitHub maintenance daily`
+- **Job ID:** `b9b9e4d731e3`
+- **Schedule:** `0 6 * * *` (06:00 UTC)
+- **Modelo:** sigue el routing global por defecto; no pinnea model/provider en el job.
 - **Skill:** `github-mirror-workflow`
 - **Delivery:** `origin`
-- **Scope del job:** fetch/prune, comparación `origin_total` vs `upstream_total` vs `origin_only`, limpieza segura solo de `origin-only` no protegidas, chequeo básico de estabilidad/tracking, reporte corto con evidencia.
+- **Scope del job:** detector/dispatcher diario. Solo crea una tarea de GitHub-maintenance cuando hay trabajo real; si no hay delta accionable, responde silencioso. La tarea debe mantenerse única, dividirse en fases si hace falta, y cerrarse al terminar.
 - **No duplicidad con Dream Cycle:** Dream queda como reflexión/sugerencias y no ejecuta housekeeping principal del mirror.
 
 ---
