@@ -1107,11 +1107,6 @@ def get_plugin_cmd_handler_names() -> Set[str]:
     return get_plugin_manager()._plugin_command_names
 
 
-def get_plugin_command_handler(name: str):
-    """Return a registered plugin command handler, if any."""
-    return get_plugin_manager()._plugin_commands.get(name)
-
-
 def get_plugin_toolsets() -> List[tuple]:
     """Return plugin toolsets as ``(key, label, description)`` tuples.
 
