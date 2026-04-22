@@ -1129,6 +1129,9 @@ def get_plugin_commands() -> Dict[str, dict]:
     return _ensure_plugins_discovered()._plugin_commands
 
 
+def get_plugin_cmd_handler_names() -> Set[str]:
+    """Return the set of plugin slash command names."""
+    return get_plugin_manager()._plugin_command_names
 def get_plugin_toolsets() -> List[tuple]:
     """Return plugin toolsets as ``(key, label, description)`` tuples.
 
