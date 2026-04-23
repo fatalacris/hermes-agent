@@ -1114,6 +1114,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"— last activity: {_last_desc}"
             )
 
+        # Guard against non-dict returns from run_conversation under error conditions
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
+            )
+
         final_response = result.get("final_response", "") or ""
         agent_messages = result.get("messages") or []
         assistant_seen = any(isinstance(m, dict) and m.get("role") == "assistant" for m in agent_messages)
@@ -1167,6 +1173,56 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
+
+        agent_messages = result.get("messages") or []
+        assistant_seen = any(isinstance(m, dict) and m.get("role") == "assistant" for m in agent_messages)
+        tool_seen = any(isinstance(m, dict) and m.get("role") == "tool" for m in agent_messages)
+        agent_failed_early = (
+            (result.get("failed") or result.get("interrupted") or result.get("completed") is False)
+            and not final_response
+            and not assistant_seen
+            and not tool_seen
+        )
+        if agent_failed_early:
+            failure_detail = result.get("error") or result.get("interrupt_message") or "agent exited before producing any assistant output"
+            raise RuntimeError(f"Cron agent failed before producing output: {failure_detail}")
+
+        integrity = job.get("_post_run_integrity") or {}
+        if integrity.get("is_dream_job"):
+            session_snapshot = None
+            if _session_db is not None:
+                session_snapshot = _session_db.get_session(_cron_session_id)
+            integrity["session_snapshot"] = session_snapshot
+            if session_snapshot is None:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': "
+                    f"cron session '{_cron_session_id}' was not persisted to SQLite"
+                )
+            message_count = int(session_snapshot.get("message_count") or 0)
+            if message_count <= 0:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': "
+                    f"cron session '{_cron_session_id}' persisted with no messages"
+                )
+            dream_log_path = Path(integrity["dream_log_path"])
+            dream_log_size_before = integrity.get("dream_log_size_before")
+            dream_log_size_after = dream_log_path.stat().st_size if dream_log_path.exists() else None
+            if dream_log_size_after is None:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': missing {dream_log_path} append"
+                )
+            if dream_log_size_before is None:
+                if dream_log_size_after <= 0:
+                    raise RuntimeError(
+                        f"Dream integrity check failed for job '{job_name}': {dream_log_path} stayed empty"
+                    )
+            elif dream_log_size_after <= dream_log_size_before:
+                raise RuntimeError(
+                    f"Dream integrity check failed for job '{job_name}': {dream_log_path} did not grow during the run"
+                )
+            integrity["session_message_count"] = message_count
+            integrity["dream_log_size_after"] = dream_log_size_after
+
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -1240,12 +1296,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_dir = _hermes_home / "cron"
+    lock_file = lock_dir / ".tick.lock"
+    lock_dir.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(lock_file, "w")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:

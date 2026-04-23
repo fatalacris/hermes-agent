@@ -778,9 +778,6 @@ class TestRunJobSessionPersistence:
         tick() should mark the job as error so last_status != 'ok'.
         (issue #8585)
         """
-        from cron.scheduler import tick
-        from cron.jobs import load_jobs, save_jobs
-
         job = {
             "id": "empty-job",
             "name": "empty-test",
@@ -791,8 +788,6 @@ class TestRunJobSessionPersistence:
             "deliver": "local",
             "last_status": None,
         }
-
-        fake_db = MagicMock()
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler.get_due_jobs", return_value=[job]), \
@@ -809,6 +804,46 @@ class TestRunJobSessionPersistence:
         assert call_args[0][0] == "empty-job"
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
+
+    def test_run_job_failed_early_result_is_error(self, tmp_path):
+        """A failed early agent result with no assistant/tool output must not be marked ok."""
+        job = {
+            "id": "failed-early-job",
+            "name": "failed early test",
+            "prompt": "test early failure",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "failed": True,
+                "completed": False,
+                "final_response": None,
+                "messages": [{"role": "user", "content": "test early failure"}],
+                "error": "Non-retryable client error",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "Cron agent failed before producing output" in error
+        assert "FAILED" in output
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
@@ -1224,6 +1259,12 @@ class TestRunJobSkillBacked:
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_home(self, tmp_path):
+        """Keep tick() lock/output state isolated under xdist."""
+        with patch("cron.scheduler._hermes_home", tmp_path):
+            yield
+
     def _make_job(self):
         return {
             "id": "monitor-job",
@@ -1572,6 +1613,12 @@ class TestBuildJobPromptMissingSkill:
 class TestTickAdvanceBeforeRun:
     """Verify that tick() calls advance_next_run before run_job for crash safety."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_home(self, tmp_path):
+        """Keep tick() lock/output state isolated under xdist."""
+        with patch("cron.scheduler._hermes_home", tmp_path):
+            yield
+
     def test_advance_called_before_run_job(self, tmp_path):
         """advance_next_run must be called before run_job to prevent crash-loop re-fires."""
         call_order = []
@@ -1609,6 +1656,12 @@ class TestTickAdvanceBeforeRun:
 
 class TestTickIntegrityWatchdog:
     """Verify tick() surfaces stale cron metadata instead of silently succeeding."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_home(self, tmp_path):
+        """Keep tick() lock/output state isolated under xdist."""
+        with patch("cron.scheduler._hermes_home", tmp_path):
+            yield
 
     def test_stale_jobs_metadata_triggers_failure_mark(self, tmp_path):
         job = {
@@ -1737,11 +1790,8 @@ class TestParallelTick:
 
     @pytest.fixture(autouse=True)
     def _isolate_tick_lock(self, tmp_path):
-        """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
-        lock_dir = tmp_path / "cron"
-        lock_dir.mkdir()
-        with patch("cron.scheduler._LOCK_DIR", lock_dir), \
-             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+        """Point tick() at a per-test Hermes home to avoid xdist contention."""
+        with patch("cron.scheduler._hermes_home", tmp_path):
             yield
 
     def test_parallel_jobs_run_concurrently(self):
