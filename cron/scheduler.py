@@ -1247,12 +1247,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_dir = _hermes_home / "cron"
+    lock_file = lock_dir / ".tick.lock"
+    lock_dir.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(lock_file, "w")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
