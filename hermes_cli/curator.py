@@ -229,6 +229,64 @@ def _cmd_restore(args) -> int:
     return 0 if ok else 1
 
 
+def _cmd_inspect(args) -> int:
+    from agent import curator
+    inventory = curator.inspect_skills()
+    try:
+        path = curator.write_governance_inventory(inventory, args.out)
+    except curator.CuratorGovernanceError as e:
+        print(f"curator: inspect refused: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"curator: wrote inventory to {path}")
+    print("curator: inspect is read-only; no skills mutated")
+    return 0
+
+
+def _cmd_propose(args) -> int:
+    from agent import curator
+    plan = curator.generate_governance_plan(mode="propose")
+    try:
+        path = curator.write_governance_plan(plan, args.out)
+    except curator.CuratorGovernanceError as e:
+        print(f"curator: propose refused: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"curator: wrote governance plan to {path}")
+    print(
+        "curator: propose is read-only; "
+        f"skills_to_change={plan['summary']['skills_to_change']} "
+        f"blast_radius_pct={plan['summary']['blast_radius_pct']}"
+    )
+    return 0
+
+
+def _cmd_stage(args) -> int:
+    from agent import curator
+    try:
+        result = curator.stage_governance_plan(args.plan, args.target)
+    except curator.CuratorGovernanceError as e:
+        print(f"curator: stage refused: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"curator: staged plan artifacts in {result['target_dir']}")
+    print("curator: source/live skills were not mutated")
+    return 0
+
+
+def _cmd_apply(args) -> int:
+    from agent import curator
+    try:
+        result = curator.validate_apply_governance_plan(
+            args.plan,
+            approval_id=args.approval_id,
+            live=bool(args.live),
+        )
+    except curator.CuratorGovernanceError as e:
+        print(f"curator: apply refused: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"curator: apply refused: {result['reason']}")
+    print("curator: v1 validates gates only; no live mutation performed")
+    raise SystemExit(2)
+
+
 # ---------------------------------------------------------------------------
 # argparse wiring (called from hermes_cli.main)
 # ---------------------------------------------------------------------------
@@ -269,6 +327,25 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     p_restore = subs.add_parser("restore", help="Restore an archived skill")
     p_restore.add_argument("skill", help="Skill name")
     p_restore.set_defaults(func=_cmd_restore)
+
+    p_inspect = subs.add_parser("inspect", help="Write read-only Curator Governance v1 inventory")
+    p_inspect.add_argument("--out", required=True, help="Output directory for inventory.json and SUMMARY.md")
+    p_inspect.set_defaults(func=_cmd_inspect)
+
+    p_propose = subs.add_parser("propose", help="Write read-only Curator Governance v1 plan")
+    p_propose.add_argument("--out", required=True, help="Output directory for plan.json and PLAN.md")
+    p_propose.set_defaults(func=_cmd_propose)
+
+    p_stage = subs.add_parser("stage", help="Stage governance artifacts into a copied skills directory")
+    p_stage.add_argument("--plan", required=True, help="Path to CuratorPlanV1 plan.json")
+    p_stage.add_argument("--target", required=True, help="Copied skills directory to receive staging artifacts")
+    p_stage.set_defaults(func=_cmd_stage)
+
+    p_apply = subs.add_parser("apply", help="Validate live-apply gates for a CuratorPlanV1")
+    p_apply.add_argument("--plan", required=True, help="Path to CuratorPlanV1 plan.json")
+    p_apply.add_argument("--approval-id", required=False, help="ARK/Cris approval identifier required for --live")
+    p_apply.add_argument("--live", action="store_true", help="Explicitly request live apply validation")
+    p_apply.set_defaults(func=_cmd_apply)
 
 
 def cli_main(argv=None) -> int:

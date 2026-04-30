@@ -49,8 +49,14 @@ def _write_skill(skills_dir: Path, name: str):
 # Config gates
 # ---------------------------------------------------------------------------
 
-def test_curator_enabled_default_true(curator_env):
-    assert curator_env["curator"].is_enabled() is True
+def test_curator_enabled_default_false(curator_env):
+    assert curator_env["curator"].is_enabled() is False
+
+
+def test_curator_enabled_via_config(curator_env, monkeypatch):
+    c = curator_env["curator"]
+    monkeypatch.setattr(c, "_load_config", lambda: {"enabled": True})
+    assert c.is_enabled() is True
 
 
 def test_curator_disabled_via_config(curator_env, monkeypatch):
@@ -86,8 +92,9 @@ def test_curator_config_overrides(curator_env, monkeypatch):
 # should_run_now
 # ---------------------------------------------------------------------------
 
-def test_first_run_always_eligible(curator_env):
+def test_first_run_always_eligible(curator_env, monkeypatch):
     c = curator_env["curator"]
+    monkeypatch.setattr(c, "_load_config", lambda: {"enabled": True})
     assert c.should_run_now() is True
 
 
@@ -100,11 +107,12 @@ def test_recent_run_blocks(curator_env):
     assert c.should_run_now() is False
 
 
-def test_old_run_eligible(curator_env):
+def test_old_run_eligible(curator_env, monkeypatch):
     """A run older than the configured interval should re-trigger. Use a
     2x-interval cushion so the test doesn't become coupled to the exact
     default — bumping DEFAULT_INTERVAL_HOURS shouldn't break it."""
     c = curator_env["curator"]
+    monkeypatch.setattr(c, "_load_config", lambda: {"enabled": True})
     long_ago = datetime.now(timezone.utc) - timedelta(
         hours=c.get_interval_hours() * 2
     )
@@ -325,6 +333,7 @@ def test_maybe_run_curator_enforces_idle_gate(curator_env, monkeypatch):
 
 def test_maybe_run_curator_runs_when_eligible(curator_env, monkeypatch):
     c = curator_env["curator"]
+    monkeypatch.setattr(c, "_load_config", lambda: {"enabled": True})
     skills_dir = curator_env["home"] / "skills"
     _write_skill(skills_dir, "a")
     # Force idle over threshold
@@ -618,6 +627,7 @@ def test_curator_slot_is_canonical_aux_task():
     from hermes_cli.web_server import _AUX_TASK_SLOTS
 
     # 1. DEFAULT_CONFIG.auxiliary — schema source
+    assert DEFAULT_CONFIG["curator"]["enabled"] is False
     assert "curator" in DEFAULT_CONFIG["auxiliary"], \
         "curator missing from DEFAULT_CONFIG['auxiliary']"
     slot = DEFAULT_CONFIG["auxiliary"]["curator"]

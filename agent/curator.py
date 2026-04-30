@@ -21,11 +21,15 @@ Strict invariants:
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -40,6 +44,36 @@ DEFAULT_INTERVAL_HOURS = 24 * 7  # 7 days
 DEFAULT_MIN_IDLE_HOURS = 2
 DEFAULT_STALE_AFTER_DAYS = 30
 DEFAULT_ARCHIVE_AFTER_DAYS = 90
+
+POLICY_VERSION = "ark-curator-governance-v1"
+PLAN_SCHEMA_V1 = "CuratorPlanV1"
+DEFAULT_PROTECTED_SKILLS = (
+    "critical-skill-verification-audit",
+    "fati-cris-execution-contract",
+    "fati-task-governance-model",
+    "fati-task-start-and-triage",
+    "github-mirror-workflow",
+    "memory-audit-compaction",
+    "mission-control-hq-startup",
+    "mission-control-state-safety",
+    "mission-control-task-profiles",
+    "telegram-polling-reentry-guardrail",
+)
+DEFAULT_PROTECTED_PATTERNS = (
+    "fati-*",
+    "ark-*",
+    "mission-control-*",
+    "gateway-*",
+    "*safety*",
+    "*governance*",
+)
+DEFAULT_MAX_LIVE_ARCHIVES = 0
+DEFAULT_MAX_CATALOG_DELTA_PCT = 5
+DEFAULT_MAX_LIVE_MUTATIONS = 3
+
+
+class CuratorGovernanceError(ValueError):
+    """Raised when a governance plan violates Curator Governance v1 gates."""
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +161,14 @@ def _load_config() -> Dict[str, Any]:
 
 
 def is_enabled() -> bool:
-    """Default ON when no config says otherwise."""
+    """Default OFF when no config says otherwise.
+
+    Curator can mutate operational skill memory through the legacy `run` path,
+    so Governance v1 requires explicit opt-in before background/session hooks can
+    execute it. Read-only `inspect`/`propose` do not use this gate.
+    """
     cfg = _load_config()
-    return bool(cfg.get("enabled", True))
+    return bool(cfg.get("enabled", False))
 
 
 def get_interval_hours() -> int:
@@ -162,6 +201,467 @@ def get_archive_after_days() -> int:
         return int(cfg.get("archive_after_days", DEFAULT_ARCHIVE_AFTER_DAYS))
     except (TypeError, ValueError):
         return DEFAULT_ARCHIVE_AFTER_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Curator Governance v1 — read-only proposal workflow
+# ---------------------------------------------------------------------------
+
+def _skills_root(source_root: Optional[os.PathLike[str] | str] = None) -> Path:
+    return Path(source_root) if source_root is not None else get_hermes_home() / "skills"
+
+
+def _read_skill_name_from_file(skill_md: Path) -> str:
+    try:
+        return skill_usage._read_skill_name(skill_md, fallback=skill_md.parent.name)
+    except Exception:
+        return skill_md.parent.name
+
+
+def _load_usage_for_root(source_root: Path) -> Dict[str, Dict[str, Any]]:
+    path = source_root / ".usage.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_manifest_names(source_root: Path, filename: str) -> Set[str]:
+    path = source_root / filename
+    names: Set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return names
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        names.add(stripped.split(":", 1)[0].strip())
+    return names
+
+
+def _read_hub_lock_names(source_root: Path) -> Set[str]:
+    """Return skill names managed by the Hermes skill hub lock file."""
+    path = source_root / ".hub" / "lock.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    names: Set[str] = set()
+    if isinstance(data, dict):
+        entries = data.get("installed") or data.get("skills") or data.get("entries") or data.get("packages") or {}
+        if isinstance(entries, dict):
+            for key, value in entries.items():
+                if isinstance(value, dict):
+                    name = value.get("name") or value.get("skill") or key
+                else:
+                    name = key
+                if isinstance(name, str) and name:
+                    names.add(name)
+        elif isinstance(entries, list):
+            for item in entries:
+                if isinstance(item, str):
+                    names.add(item)
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("skill")
+                    if isinstance(name, str) and name:
+                        names.add(name)
+    return names
+
+
+def _snapshot_hash(source_root: Path) -> str:
+    digest = hashlib.sha256()
+    if not source_root.exists():
+        return digest.hexdigest()
+    for path in sorted(p for p in source_root.rglob("*") if p.is_file()):
+        try:
+            rel = path.relative_to(source_root)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if parts and (parts[0] in {".archive", ".hub", "node_modules"} or parts[0].startswith(".tmp")):
+            continue
+        digest.update(str(rel).encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"<unreadable>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _protected_policy(inventory: List[Dict[str, Any]]) -> tuple[List[str], List[str]]:
+    protected = set(DEFAULT_PROTECTED_SKILLS)
+    for row in inventory:
+        if row.get("pinned"):
+            protected.add(str(row.get("name")))
+    return sorted(p for p in protected if p), list(DEFAULT_PROTECTED_PATTERNS)
+
+
+def _is_protected_skill(name: str, protected_skills: List[str], protected_patterns: List[str]) -> bool:
+    normalized = name.casefold()
+    protected = {str(skill).casefold() for skill in (protected_skills or [])}
+    patterns = [str(pattern).casefold() for pattern in (protected_patterns or [])]
+    return normalized in protected or any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
+
+
+def _assert_artifact_output_target(out_dir: os.PathLike[str] | str, source_root: os.PathLike[str] | str) -> Path:
+    """Resolve and validate a governance artifact output directory.
+
+    `inspect` and `propose` are read-only with respect to live/source skills.
+    They may write report artifacts, but never into the source skills tree or
+    the active Hermes skills tree (including subdirectories).
+    """
+    out = Path(out_dir).resolve()
+    source = Path(source_root).resolve()
+    live = (get_hermes_home() / "skills").resolve()
+    if out == source or out == live or source in out.parents or live in out.parents:
+        raise CuratorGovernanceError(
+            "output target must be outside source/live skills root; use an artifact directory"
+        )
+    return out
+
+
+def inspect_skills(source_root: Optional[os.PathLike[str] | str] = None) -> Dict[str, Any]:
+    """Return current agent-created skill inventory without mutating skills.
+
+    This intentionally reads the requested source_root directly instead of
+    running auto-transitions. It is the safe discovery primitive for ARK-owned
+    governance decisions.
+    """
+    root = _skills_root(source_root)
+    usage_data = _load_usage_for_root(root)
+    off_limits = (
+        _read_manifest_names(root, ".bundled_manifest")
+        | _read_manifest_names(root, ".hub_installed")
+        | _read_hub_lock_names(root)
+    )
+    rows: List[Dict[str, Any]] = []
+    for skill_md in sorted(root.rglob("SKILL.md")):
+        try:
+            rel = skill_md.relative_to(root)
+        except ValueError:
+            continue
+        if rel.parts and (rel.parts[0].startswith(".") or rel.parts[0] == "node_modules"):
+            continue
+        name = _read_skill_name_from_file(skill_md)
+        if name in off_limits:
+            continue
+        rec = usage_data.get(name) if isinstance(usage_data.get(name), dict) else {}
+        base = {
+            "use_count": 0,
+            "view_count": 0,
+            "last_used_at": None,
+            "last_viewed_at": None,
+            "patch_count": 0,
+            "last_patched_at": None,
+            "created_at": None,
+            "state": skill_usage.STATE_ACTIVE,
+            "pinned": False,
+            "archived_at": None,
+        }
+        base.update(rec)
+        rows.append({
+            "name": name,
+            "path": str(skill_md.parent),
+            "relative_path": str(skill_md.parent.relative_to(root)),
+            **base,
+        })
+    protected_skills, protected_patterns = _protected_policy(rows)
+    return {
+        "schema": "CuratorInventoryV1",
+        "policy_version": POLICY_VERSION,
+        "source_root": str(root),
+        "source_snapshot_hash": _snapshot_hash(root),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "protected_skills_checked": True,
+        "protected_skills": protected_skills,
+        "protected_patterns": protected_patterns,
+        "skills": rows,
+        "summary": {"skills_inspected": len(rows)},
+    }
+
+
+def _proposal_for_row(row: Dict[str, Any], protected_skills: List[str], protected_patterns: List[str]) -> Dict[str, Any]:
+    name = str(row.get("name") or "")
+    state = row.get("state", skill_usage.STATE_ACTIVE)
+    protected = _is_protected_skill(name, protected_skills, protected_patterns)
+    if protected:
+        return {
+            "skill": name,
+            "action": "keep",
+            "reason": "protected by Curator Governance v1",
+            "protected": True,
+            "ark_decision_required": False,
+            "rollback": "No mutation proposed.",
+        }
+    if state in {skill_usage.STATE_STALE, skill_usage.STATE_ARCHIVED}:
+        return {
+            "skill": name,
+            "action": "archive",
+            "reason": f"metadata state is {state}; v1 proposes only for ARK review, no mutation",
+            "protected": False,
+            "ark_decision_required": True,
+            "rollback": f"If later applied and regretted, restore {name} from .archive or source control.",
+        }
+    return {
+        "skill": name,
+        "action": "keep",
+        "reason": "conservative v1 default: keep unless stale/archived metadata requires ARK review",
+        "protected": False,
+        "ark_decision_required": False,
+        "rollback": "No mutation proposed.",
+    }
+
+
+def generate_governance_plan(
+    source_root: Optional[os.PathLike[str] | str] = None,
+    *,
+    run_id: Optional[str] = None,
+    mode: str = "propose",
+) -> Dict[str, Any]:
+    """Build a machine-readable CuratorPlanV1 without mutating source skills."""
+    inventory = inspect_skills(source_root=source_root)
+    protected_skills = list(inventory["protected_skills"])
+    protected_patterns = list(inventory["protected_patterns"])
+    proposals = [
+        _proposal_for_row(row, protected_skills, protected_patterns)
+        for row in inventory["skills"]
+    ]
+    blocked = [
+        {
+            "skill": p["skill"],
+            "action": p["action"],
+            "reason": "protected skill/pattern cannot be mutated",
+        }
+        for p in proposals
+        if p.get("protected") and p.get("action") != "keep"
+    ]
+    skills_to_change = sum(1 for p in proposals if p.get("action") != "keep")
+    skills_to_archive = sum(1 for p in proposals if p.get("action") == "archive")
+    total = len(proposals)
+    blast_radius_pct = round((skills_to_change / total) * 100, 2) if total else 0
+    return {
+        "schema": PLAN_SCHEMA_V1,
+        "policy_version": POLICY_VERSION,
+        "run_id": run_id or f"curator-plan-{uuid.uuid4().hex[:12]}",
+        "mode": mode,
+        "source_root": inventory["source_root"],
+        "source_snapshot_hash": inventory["source_snapshot_hash"],
+        "generated_at": inventory["generated_at"],
+        "protected_skills_checked": True,
+        "protected_skills": protected_skills,
+        "protected_patterns": protected_patterns,
+        "proposals": proposals,
+        "blocked": blocked,
+        "summary": {
+            "skills_inspected": total,
+            "skills_to_change": skills_to_change,
+            "skills_to_archive": skills_to_archive,
+            "new_umbrellas": 0,
+            "blast_radius_pct": blast_radius_pct,
+        },
+    }
+
+
+def _render_inventory_summary(inventory: Dict[str, Any]) -> str:
+    summary = inventory.get("summary") or {}
+    return "\n".join([
+        "# Curator inventory",
+        "",
+        f"Policy: `{inventory.get('policy_version')}`",
+        f"Source root: `{inventory.get('source_root')}`",
+        f"Snapshot hash: `{inventory.get('source_snapshot_hash')}`",
+        f"Skills inspected: {summary.get('skills_inspected', 0)}",
+        "",
+    ])
+
+
+def _render_plan_markdown(plan: Dict[str, Any]) -> str:
+    summary = plan.get("summary") or {}
+    lines = [
+        f"# Curator governance plan — {plan.get('run_id')}",
+        "",
+        f"Schema: `{plan.get('schema')}`",
+        f"Policy: `{plan.get('policy_version')}`",
+        f"Mode: `{plan.get('mode')}`",
+        f"Source root: `{plan.get('source_root')}`",
+        f"Snapshot hash: `{plan.get('source_snapshot_hash')}`",
+        f"Skills inspected: {summary.get('skills_inspected', 0)}",
+        f"Skills to change: {summary.get('skills_to_change', 0)}",
+        f"Skills to archive: {summary.get('skills_to_archive', 0)}",
+        f"New umbrellas: {summary.get('new_umbrellas', 0)}",
+        f"Blast radius: {summary.get('blast_radius_pct', 0)}%",
+        "",
+        "## Proposals",
+        "",
+    ]
+    for p in plan.get("proposals") or []:
+        lines.append(f"- `{p.get('skill')}`: {p.get('action')} — {p.get('reason')}")
+        if p.get("rollback"):
+            lines.append(f"  - rollback: {p.get('rollback')}")
+        if p.get("ark_decision_required"):
+            lines.append("  - ARK decision required: yes")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_governance_inventory(inventory: Dict[str, Any], out_dir: os.PathLike[str] | str) -> Path:
+    out = _assert_artifact_output_target(out_dir, inventory.get("source_root") or get_hermes_home() / "skills")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "inventory.json").write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out / "SUMMARY.md").write_text(_render_inventory_summary(inventory), encoding="utf-8")
+    return out / "inventory.json"
+
+
+def write_governance_plan(plan: Dict[str, Any], out_dir: os.PathLike[str] | str) -> Path:
+    out = _assert_artifact_output_target(out_dir, plan.get("source_root") or get_hermes_home() / "skills")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "plan.json").write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out / "PLAN.md").write_text(_render_plan_markdown(plan), encoding="utf-8")
+    return out / "plan.json"
+
+
+def _load_plan(plan_or_path: Dict[str, Any] | os.PathLike[str] | str) -> Dict[str, Any]:
+    if isinstance(plan_or_path, dict):
+        return plan_or_path
+    try:
+        plan = json.loads(Path(plan_or_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise CuratorGovernanceError(f"invalid governance plan: {e}") from e
+    if not isinstance(plan, dict):
+        raise CuratorGovernanceError("invalid governance plan: top-level JSON must be an object")
+    return plan
+
+
+def _validate_plan_schema(plan: Dict[str, Any]) -> None:
+    if plan.get("schema") != PLAN_SCHEMA_V1:
+        raise CuratorGovernanceError("invalid governance plan schema; expected CuratorPlanV1")
+    if plan.get("policy_version") != POLICY_VERSION:
+        raise CuratorGovernanceError(f"unsupported policy_version: {plan.get('policy_version')}")
+    if not plan.get("source_root"):
+        raise CuratorGovernanceError("missing source_root")
+    if not plan.get("source_snapshot_hash"):
+        raise CuratorGovernanceError("missing source_snapshot_hash")
+    if plan.get("protected_skills_checked") is not True:
+        raise CuratorGovernanceError("protected_skills_checked must be true")
+
+
+def _assert_snapshot_current(plan: Dict[str, Any]) -> None:
+    source_root = Path(str(plan.get("source_root") or ""))
+    if not source_root.exists():
+        raise CuratorGovernanceError(f"source_root does not exist: {source_root}")
+    current_hash = _snapshot_hash(source_root)
+    if current_hash != plan.get("source_snapshot_hash"):
+        raise CuratorGovernanceError("source_snapshot_hash does not match current source_root")
+
+
+def _mutating_proposals(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [p for p in (plan.get("proposals") or []) if isinstance(p, dict) and p.get("action") != "keep"]
+
+
+def _assert_no_protected_mutations(plan: Dict[str, Any]) -> None:
+    protected_skills = sorted(set(DEFAULT_PROTECTED_SKILLS) | set(plan.get("protected_skills") or []))
+    protected_patterns = list(DEFAULT_PROTECTED_PATTERNS) + list(plan.get("protected_patterns") or [])
+    for proposal in _mutating_proposals(plan):
+        skill = str(proposal.get("skill") or proposal.get("name") or "")
+        if proposal.get("protected") or _is_protected_skill(skill, protected_skills, protected_patterns):
+            raise CuratorGovernanceError(f"proposal touches protected skill: {skill}")
+
+
+def stage_governance_plan(plan_path: os.PathLike[str] | str, target_dir: os.PathLike[str] | str) -> Dict[str, Any]:
+    """Stage a validated plan into a copied skills directory only.
+
+    V1 writes only artifacts (`plan.json`, `STAGING_SUMMARY.md`) and never edits
+    source/live skills.
+    """
+    plan = _load_plan(plan_path)
+    _validate_plan_schema(plan)
+    _assert_snapshot_current(plan)
+    _assert_no_protected_mutations(plan)
+    target = Path(target_dir).resolve()
+    source_root = Path(str(plan.get("source_root"))).resolve()
+    live_root = (get_hermes_home() / "skills").resolve()
+    if target == source_root or target == live_root or source_root in target.parents or live_root in target.parents:
+        raise CuratorGovernanceError("stage target must be outside source/live skills root; use a copied skills directory")
+    target.mkdir(parents=True, exist_ok=True)
+    staged_plan = target / "plan.json"
+    shutil.copyfile(Path(plan_path), staged_plan)
+    summary = [
+        f"# Curator staging summary — {plan.get('run_id')}",
+        "",
+        "V1 staging is artifact-only. No source/live skill files were mutated.",
+        f"Source root: `{plan.get('source_root')}`",
+        f"Snapshot hash: `{plan.get('source_snapshot_hash')}`",
+        f"Skills to change: {(plan.get('summary') or {}).get('skills_to_change', 0)}",
+        f"Blast radius: {(plan.get('summary') or {}).get('blast_radius_pct', 0)}%",
+        "",
+    ]
+    (target / "STAGING_SUMMARY.md").write_text("\n".join(summary), encoding="utf-8")
+    return {"staged": True, "target_dir": str(target), "plan_path": str(staged_plan)}
+
+
+def _summary_number(summary: Dict[str, Any], key: str, cast: Callable[[Any], Any]) -> Any:
+    try:
+        return cast(summary.get(key) or 0)
+    except (TypeError, ValueError) as e:
+        raise CuratorGovernanceError(f"invalid summary.{key}: {summary.get(key)!r}") from e
+
+
+def validate_apply_governance_plan(
+    plan: Dict[str, Any] | os.PathLike[str] | str,
+    *,
+    approval_id: Optional[str] = None,
+    live: bool = False,
+    max_live_archives: int = DEFAULT_MAX_LIVE_ARCHIVES,
+    max_catalog_delta_pct: float = DEFAULT_MAX_CATALOG_DELTA_PCT,
+    max_live_mutations: int = DEFAULT_MAX_LIVE_MUTATIONS,
+) -> Dict[str, Any]:
+    """Validate Curator Governance v1 live-apply gates.
+
+    Destructive live mutation is intentionally not implemented in v1. This
+    returns a refusal payload after all gates pass so callers can distinguish
+    authorization/threshold failures from the product-level v1 limitation.
+    """
+    payload = _load_plan(plan)
+    _validate_plan_schema(payload)
+    _assert_snapshot_current(payload)
+    if live and not approval_id:
+        raise CuratorGovernanceError("approval_id is required for live apply")
+    if not live:
+        raise CuratorGovernanceError("live=True is required explicitly for apply validation")
+    _assert_no_protected_mutations(payload)
+    summary = payload.get("summary") or {}
+    computed_archives = sum(1 for p in _mutating_proposals(payload) if p.get("action") == "archive")
+    computed_mutations = len(_mutating_proposals(payload))
+    proposal_count = len(payload.get("proposals") or [])
+    inspected = max(proposal_count, 1)
+    computed_blast_radius = round((computed_mutations / inspected) * 100, 2)
+    archives = max(_summary_number(summary, "skills_to_archive", int), computed_archives)
+    blast_radius = max(_summary_number(summary, "blast_radius_pct", float), computed_blast_radius)
+    mutations = max(_summary_number(summary, "skills_to_change", int), computed_mutations)
+    if archives > max_live_archives:
+        raise CuratorGovernanceError(
+            f"skills_to_archive {archives} exceeds max_live_archives {max_live_archives}"
+        )
+    if blast_radius > max_catalog_delta_pct:
+        raise CuratorGovernanceError(
+            f"blast_radius_pct {blast_radius} exceeds max_catalog_delta_pct {max_catalog_delta_pct}"
+        )
+    if mutations > max_live_mutations:
+        raise CuratorGovernanceError(
+            f"skills_to_change {mutations} exceeds max_live_mutations {max_live_mutations}"
+        )
+    return {
+        "ok": False,
+        "refused": True,
+        "reason": "Curator Governance v1 live apply is gated; destructive mutation is not implemented",
+        "approval_id": approval_id,
+        "live": live,
+    }
 
 
 # ---------------------------------------------------------------------------

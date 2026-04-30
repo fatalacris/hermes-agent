@@ -960,6 +960,10 @@ DEFAULT_CONFIG = {
 
     # Curator — background skill maintenance.
     #
+    # Disabled by default. Curator can mutate the operational skill library via
+    # legacy run paths, so activation requires an explicit local config opt-in.
+    # Read-only governance commands (`inspect`/`propose`) remain available.
+    #
     # Periodically reviews AGENT-CREATED skills (never bundled or
     # hub-installed) and keeps the collection tidy: marks long-unused skills
     # as stale, archives genuinely obsolete ones (archive only, never
@@ -969,7 +973,7 @@ DEFAULT_CONFIG = {
     #
     # See `hermes curator status` for the last run summary.
     "curator": {
-        "enabled": True,
+        "enabled": False,
         # How long to wait between curator runs (hours).  Default: 7 days.
         "interval_hours": 24 * 7,
         # Only run when the agent has been idle at least this long (hours).
