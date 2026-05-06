@@ -1758,6 +1758,12 @@ class TestRunJobSkillBacked:
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_home(self, tmp_path):
+        """Keep tick() lock/output state isolated under xdist."""
+        with patch("cron.scheduler._hermes_home", tmp_path):
+            yield
+
     def _make_job(self):
         return {
             "id": "monitor-job",
@@ -2154,6 +2160,12 @@ class TestBuildJobPromptBumpUse:
 class TestTickAdvanceBeforeRun:
     """Verify that tick() calls advance_next_run before run_job for crash safety."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_home(self, tmp_path):
+        """Keep tick() lock/output state isolated under xdist."""
+        with patch("cron.scheduler._hermes_home", tmp_path):
+            yield
+
     def test_advance_called_before_run_job(self, tmp_path):
         """advance_next_run must be called before run_job to prevent crash-loop re-fires."""
         call_order = []
@@ -2191,6 +2203,12 @@ class TestTickAdvanceBeforeRun:
 
 class TestTickIntegrityWatchdog:
     """Verify tick() surfaces stale cron metadata instead of silently succeeding."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_home(self, tmp_path):
+        """Keep tick() lock/output state isolated under xdist."""
+        with patch("cron.scheduler._hermes_home", tmp_path):
+            yield
 
     def test_stale_jobs_metadata_triggers_failure_mark(self, tmp_path):
         job = {
