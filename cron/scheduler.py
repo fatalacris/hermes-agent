@@ -1043,7 +1043,7 @@ def _capture_post_run_integrity(job: dict, session_id: str) -> dict:
     }
 
     if integrity["is_dream_job"]:
-        dream_log_path = _hermes_home / "dream-log.md"
+        dream_log_path = _get_hermes_home() / "dream-log.md"
         integrity["dream_log_path"] = str(dream_log_path)
         integrity["dream_log_size_before"] = dream_log_path.stat().st_size if dream_log_path.exists() else None
 

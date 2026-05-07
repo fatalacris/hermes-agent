@@ -88,6 +88,27 @@ class TestDreamJobClassification:
         }
         assert _is_dream_cycle_job(job) is True
 
+    def test_dream_integrity_snapshot_uses_resolved_hermes_home_when_override_unset(self, tmp_path):
+        """Dream cron integrity must work in normal runtime with no test-only override."""
+        import cron.scheduler as scheduler
+
+        dream_log = tmp_path / "dream-log.md"
+        dream_log.write_text("# Before\n", encoding="utf-8")
+
+        job = {
+            "id": "dream-job",
+            "name": "FATI Dream Cycle — nightly",
+            "skills": ["fati-dream-cycle"],
+        }
+
+        with patch("cron.scheduler._hermes_home", None), \
+             patch("cron.scheduler.get_hermes_home", return_value=tmp_path):
+            integrity = scheduler._capture_post_run_integrity(job, "cron_dream_demo")
+
+        assert integrity["is_dream_job"] is True
+        assert integrity["dream_log_path"] == str(dream_log)
+        assert integrity["dream_log_size_before"] == dream_log.stat().st_size
+
 
 class TestResolveDeliveryTarget:
     def test_origin_delivery_preserves_thread_id(self):
