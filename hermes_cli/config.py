@@ -780,6 +780,19 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        # Triage specifier — flesh out a rough one-liner in the Kanban
+        # Triage column into a concrete spec, then promote it to ``todo``.
+        # Invoked by ``hermes kanban specify`` (single id or --all). Set a
+        # cheap, capable model here (gemini-flash works well); the main
+        # model is overkill for short spec expansion.
+        "triage_specifier": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+        },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
         # building over hundreds of candidate skills). "auto" = use main chat
@@ -1862,6 +1875,14 @@ OPTIONAL_ENV_VARS = {
         "url": "https://searxng.github.io/searxng/",
         "tools": ["web_search"],
         "password": False,
+        "category": "tool",
+    },
+    "BRAVE_SEARCH_API_KEY": {
+        "description": "Brave Search API subscription token (free tier: 2,000 queries/mo)",
+        "prompt": "Brave Search subscription token",
+        "url": "https://brave.com/search/api/",
+        "tools": ["web_search"],
+        "password": True,
         "category": "tool",
     },
     "BROWSERBASE_API_KEY": {

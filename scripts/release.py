@@ -55,6 +55,7 @@ AUTHOR_MAP = {
     "127238744+teknium1@users.noreply.github.com": "teknium1",
     "128259593+Gutslabs@users.noreply.github.com": "Gutslabs",
     "50326054+nocturnum91@users.noreply.github.com": "nocturnum91",
+    "223003280+Abd0r@users.noreply.github.com": "Abd0r",
     "abdielv@proton.me": "AJV20",
     "mason@growagainorchids.com": "masonjames",
     "am@studio1.tailb672fe.ts.net": "subtract0",
@@ -424,7 +425,7 @@ AUTHOR_MAP = {
     "camilo@tekelala.com": "tekelala",
     "vincentcharlebois@gmail.com": "vincentcharlebois",
     "aryan@synvoid.com": "aryansingh",
-    "johnsonblake1@gmail.com": "blakejohnson",
+    "johnsonblake1@gmail.com": "voteblake",
     "hcn518@gmail.com": "pedh",
     "haileymarshall005@gmail.com": "haileymarshall",
     "greer.guthrie@gmail.com": "g-guthrie",
@@ -891,6 +892,15 @@ AUTHOR_MAP = {
     "paultian.research@gmail.com": "paul-tian",  # PR #19423
     "info@glesperance.com": "glesperance",  # PR #19443
     "lxl694522264@gmail.com": "EvilDrag0n",  # PR #20651
+    # v0.13.0 additions
+    "clode@clo5de.info": "jackey8616",  # via PR salvage
+    "james.russo@heygen.com": "jrusso1020",  # via PR salvage
+    "leon@sgp43.com": "LeonSGP43",  # PR #18739 salvage of #14570
+    "miniding@miniding.home": "Foolafroos",  # PR #20329 French locale
+    "montbra@gmail.com": "Montbra",  # PR #20897 salvage of #16189 (TUI voice PTT)
+    "promptsiren@gmail.com": "firefly",  # PR #18123 salvage of #16660 (ContextVars)
+    "wtyopenclaw@gmail.com": "WuTianyi123",  # PR #20275 salvage of #13723 (feishu markdown)
+    # pander: empty email, salvaged via PR #19665 from #16126 by @ms-alan
 }
 
 
