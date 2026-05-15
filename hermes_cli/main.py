@@ -4372,7 +4372,7 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
         return existing_key, False
     try:
         choice = input("  [K]eep / [R]eplace / [C]lear (default K): ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
+    except (KeyboardInterrupt, EOFError, OSError, StopIteration):
         print()
         choice = "k"
 
@@ -5009,7 +5009,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
 
     try:
         override = input(f"Base URL [{effective_base}]: ").strip()
-    except (KeyboardInterrupt, EOFError):
+    except (KeyboardInterrupt, EOFError, OSError, StopIteration):
         print()
         override = ""
     if override and base_url_env:
